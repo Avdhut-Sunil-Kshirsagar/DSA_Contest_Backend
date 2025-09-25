@@ -1,0 +1,314 @@
+import ContestResult from '../models/ContestResult.js';
+import Problem from '../models/Problem.js';
+import Contest from '../models/Contest.js';
+import { CodeRunner } from '../utils/codeRunner.js';
+
+const codeRunner = new CodeRunner();
+
+// @desc    Submit solution
+// @route   POST /api/submissions
+// @access  Private
+export const submitSolution = async (req, res) => {
+  try {
+    const { contestId, problemId, code, language } = req.body;
+    const userId = req.user.id;
+
+    // Check if contest exists and is active
+    const contest = await Contest.findById(contestId);
+    if (!contest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Contest not found'
+      });
+    }
+
+    // Check if contest is currently running
+    const now = new Date();
+    if (now < contest.startTime || now > contest.endTime) {
+      return res.status(400).json({
+        success: false,
+        message: 'Contest is not currently running'
+      });
+    }
+
+    // Check if problem exists in contest
+    const problemInContest = (Array.isArray(contest.problems) ? contest.problems : []).find(p => p.problemId.toString() === problemId);
+    const pointsForProblem = problemInContest ? problemInContest.points : (await Problem.findById(problemId))?.points || 100;
+    
+    if (!problemInContest) {
+      return res.status(400).json({
+        success: false,
+        message: 'Problem not found in this contest'
+      });
+    }
+
+    // Get problem details with test cases
+    const problem = await Problem.findById(problemId);
+    if (!problem) {
+      return res.status(404).json({
+        success: false,
+        message: 'Problem not found'
+      });
+    }
+
+    // Run code against test cases
+    try {
+      const combinedCode = combineWithHarness(code, language, problem);
+      const testResults = await codeRunner.runCode(combinedCode, language, problem.testCases);
+
+      // Update submission with results
+      const maxScore = pointsForProblem;
+      const passed = testResults.filter(r => r.passed).length;
+      const total = testResults.length;
+      const score = total > 0 ? Math.round((passed / total) * maxScore) : 0;
+
+      // Update contest result
+      await updateContestResult(userId, contestId, problemId, {
+        score,
+        totalExecutionTime: testResults.reduce((s, r) => s + (r.executionTime || 0), 0),
+        status: score === maxScore ? 'accepted' : (score > 0 ? 'partial' : 'attempted')
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'Solution submitted successfully',
+        data: {
+          status: score === maxScore ? 'accepted' : (score > 0 ? 'partial' : 'attempted'),
+          score,
+          maxScore,
+          testResults,
+          totalExecutionTime: testResults.reduce((s, r) => s + (r.executionTime || 0), 0)
+        }
+      });
+
+    } catch (executionError) {
+      res.status(200).json({
+        success: true,
+        message: 'Solution submitted with errors',
+        data: {
+          status: 'runtime_error',
+          score: 0,
+          maxScore: problemInContest.points,
+          error: executionError.message
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Submit solution error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to submit solution',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get user submissions for a contest
+// @route   GET /api/submissions/contest/:contestId
+// @access  Private
+export const getContestSubmissions = async (req, res) => {
+  try {
+    const { contestId } = req.params;
+    const userId = req.user.id;
+    // No per-attempt persistence; respond with empty list for compatibility
+    const submissions = [];
+
+    res.status(200).json({
+      success: true,
+      data: submissions
+    });
+  } catch (error) {
+    console.error('Get submissions error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch submissions',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get single submission
+// @route   GET /api/submissions/:id
+// @access  Private
+export const getSubmission = async (req, res) => {
+  try {
+    res.status(200).json({
+      success: true,
+      data: null
+    });
+  } catch (error) {
+    console.error('Get submission error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch submission',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Submit final contest results
+// @route   POST /api/submissions/final
+// @access  Private
+export const submitFinalResults = async (req, res) => {
+  try {
+    const { userId, contestId, totalScore, penaltyPoints, problemResults, totalTime } = req.body;
+    const authenticatedUserId = req.user.id;
+
+    // Verify user ID matches authenticated user
+    if (userId !== authenticatedUserId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    // Check if contest exists
+    const contest = await Contest.findById(contestId);
+    if (!contest) {
+      return res.status(404).json({
+        success: false,
+        message: 'Contest not found'
+      });
+    }
+
+    // Create or update contest result
+    let contestResult = await ContestResult.findOne({ userId, contestId });
+    
+    if (!contestResult) {
+      contestResult = await ContestResult.create({
+        userId,
+        contestId,
+        problemResults: contest.problems.map(p => ({
+          problemId: p.problemId,
+          maxScore: p.points,
+          status: 'not_attempted'
+        }))
+      });
+    }
+
+    // Update final results
+    contestResult.totalScore = totalScore;
+    contestResult.penalties = penaltyPoints;
+    contestResult.totalTime = totalTime;
+    contestResult.completedAt = new Date();
+    contestResult.isCompleted = true;
+
+    // Update individual problem results
+    problemResults.forEach(problemResult => {
+      contestResult.updateProblemResult(
+        problemResult.problemId,
+        problemResult.score,
+        0, // execution time not available in final submission
+        problemResult.score > 0 ? 'accepted' : 'attempted',
+        false
+      );
+    });
+
+    await contestResult.save();
+
+    // We do not persist per-problem submissions
+
+    res.status(200).json({
+      success: true,
+      message: 'Final results submitted successfully',
+      data: {
+        contestResultId: contestResult._id,
+        totalScore: totalScore,
+        penaltyPoints: penaltyPoints,
+        totalTime: totalTime,
+        completedAt: contestResult.completedAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Submit final results error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to submit final results',
+      error: error.message
+    });
+  }
+};
+
+// Helper function to update contest result
+async function updateContestResult(userId, contestId, problemId, submission) {
+  try {
+    let contestResult = await ContestResult.findOne({ userId, contestId });
+    
+    if (!contestResult) {
+      // Create new contest result if it doesn't exist
+      const contest = await Contest.findById(contestId);
+      contestResult = await ContestResult.create({
+        userId,
+        contestId,
+        problemResults: contest.problems.map(p => ({
+          problemId: p.problemId,
+          maxScore: p.points,
+          status: 'not_attempted'
+        }))
+      });
+    }
+
+    // Update problem result
+    const isFirstAccept = submission.status === 'accepted';
+    
+    const status = submission.status === 'accepted' ? 'accepted' : 
+                  submission.score > 0 ? 'partial' : 'attempted';
+
+    contestResult.updateProblemResult(
+      problemId,
+      submission.score,
+      submission.totalExecutionTime,
+      status,
+      isFirstAccept
+    );
+
+    await contestResult.save();
+  } catch (error) {
+    console.error('Update contest result error:', error);
+  }
+}
+
+function combineWithHarness(userCode, language, problem) {
+  let harness = '';
+  const raw = problem?.harshnessCode ?? problem?.harnessCode ?? '';
+  
+  // Handle both harshnessCode and harnessCode fields
+  if (typeof raw === 'object' && raw !== null) {
+    harness = String(raw[language] || '').trim();
+  } else {
+    harness = String(raw || '').trim();
+  }
+  
+  // If no harness code, return user code as is
+  if (!harness) return userCode;
+  
+  // Combine user code with harness code
+  if (language === 'javascript') {
+    return `${userCode}
+// --- HARNESS START ---
+${harness}
+// --- HARNESS END ---`;
+  }
+  if (language === 'python') {
+    return `${userCode}
+# --- HARNESS START ---
+${harness}
+# --- HARNESS END ---`;
+  }
+  if (language === 'cpp') {
+    return `${userCode}
+// --- HARNESS START ---
+${harness}
+// --- HARNESS END ---`;
+  }
+  if (language === 'java') {
+    return `${userCode}
+// --- HARNESS START ---
+${harness}
+// --- HARNESS END ---`;
+  }
+  
+  return userCode;
+}
