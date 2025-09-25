@@ -187,20 +187,44 @@ export const submitFinalResults = async (req, res) => {
       });
     }
 
+    // Helper to parse HH:MM:SS into milliseconds; also accept numeric seconds/ms
+    const parseDurationToMs = (value) => {
+      if (value == null) return 0;
+      if (typeof value === 'number' && !Number.isNaN(value)) {
+        // Assume already milliseconds if large, otherwise seconds
+        return value > 3600 ? Math.floor(value) : Math.floor(value * 1000);
+      }
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        // If plain number string
+        if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+          const num = Number(trimmed);
+          return num > 3600 ? Math.floor(num) : Math.floor(num * 1000);
+        }
+        // HH:MM:SS
+        const parts = trimmed.split(':').map((p) => Number(p));
+        if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+          const [hh, mm, ss] = parts;
+          return ((hh * 3600) + (mm * 60) + ss) * 1000;
+        }
+      }
+      return 0;
+    };
+
     // Update final results
-    contestResult.totalScore = totalScore;
-    contestResult.penalties = penaltyPoints;
-    contestResult.totalTime = totalTime;
+    contestResult.totalScore = Number(totalScore) || 0;
+    contestResult.penalties = Number(penaltyPoints) || 0;
+    contestResult.totalTime = parseDurationToMs(totalTime);
     contestResult.completedAt = new Date();
     contestResult.isCompleted = true;
 
     // Update individual problem results
-    problemResults.forEach(problemResult => {
+    (Array.isArray(problemResults) ? problemResults : []).forEach(problemResult => {
       contestResult.updateProblemResult(
         problemResult.problemId,
-        problemResult.score,
+        Number(problemResult.score) || 0,
         0, // execution time not available in final submission
-        problemResult.score > 0 ? 'accepted' : 'attempted',
+        (Number(problemResult.score) || 0) > 0 ? 'accepted' : 'attempted',
         false
       );
     });
@@ -209,6 +233,16 @@ export const submitFinalResults = async (req, res) => {
 
     // We do not persist per-problem submissions
 
+    // Helper to format milliseconds to HH:MM:SS
+    const formatMsToHHMMSS = (ms) => {
+      const totalSeconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+      const hh = Math.floor(totalSeconds / 3600);
+      const mm = Math.floor((totalSeconds % 3600) / 60);
+      const ss = totalSeconds % 60;
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+    };
+
     res.status(200).json({
       success: true,
       message: 'Final results submitted successfully',
@@ -216,7 +250,7 @@ export const submitFinalResults = async (req, res) => {
         contestResultId: contestResult._id,
         totalScore: totalScore,
         penaltyPoints: penaltyPoints,
-        totalTime: totalTime,
+        totalTime: formatMsToHHMMSS(contestResult.totalTime),
         completedAt: contestResult.completedAt
       }
     });
