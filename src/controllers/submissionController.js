@@ -57,10 +57,15 @@ export const submitSolution = async (req, res) => {
       const testResults = await codeRunner.runCode(combinedCode, language, problem.testCases);
 
       // Update submission with results
-      const maxScore = pointsForProblem;
-      const passed = testResults.filter(r => r.passed).length;
-      const total = testResults.length;
-      const score = total > 0 ? Math.round((passed / total) * maxScore) : 0;
+      // Score is calculated as the sum of points for each passed test case (from DB)
+      const perTestPoints = Array.isArray(problem.testCases)
+        ? problem.testCases.map(tc => Number(tc.points) || 0)
+        : [];
+      const maxScore = perTestPoints.reduce((s, p) => s + p, 0);
+      const score = testResults.reduce((sum, r, idx) => {
+        const pts = perTestPoints[idx] || 0;
+        return sum + (r.passed ? pts : 0);
+      }, 0);
 
       // Update contest result
       await updateContestResult(userId, contestId, problemId, {
@@ -273,14 +278,26 @@ async function updateContestResult(userId, contestId, problemId, submission) {
     if (!contestResult) {
       // Create new contest result if it doesn't exist
       const contest = await Contest.findById(contestId);
+      const problemIds = (Array.isArray(contest?.problems) ? contest.problems : []).map(p => p.problemId);
+      const problemDocs = await Problem.find({ _id: { $in: problemIds } }, { testCases: 1, points: 1 });
+      const probMap = new Map(problemDocs.map(p => [String(p._id), p]));
       contestResult = await ContestResult.create({
         userId,
         contestId,
-        problemResults: contest.problems.map(p => ({
-          problemId: p.problemId,
-          maxScore: p.points,
-          status: 'not_attempted'
-        }))
+        problemResults: (Array.isArray(contest?.problems) ? contest.problems : []).map(p => {
+          const full = probMap.get(String(p.problemId));
+          let maxScore = Number(p.points) || 0;
+          if (full && Array.isArray(full.testCases) && full.testCases.length > 0) {
+            maxScore = full.testCases.reduce((s, tc) => s + (Number(tc.points) || 0), 0);
+          } else if (full && typeof full.points === 'number') {
+            maxScore = Number(full.points) || 0;
+          }
+          return {
+            problemId: p.problemId,
+            maxScore,
+            status: 'not_attempted'
+          };
+        })
       });
     }
 

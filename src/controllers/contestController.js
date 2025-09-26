@@ -10,10 +10,35 @@ export const getContests = async (req, res) => {
   try {
     const contests = await Contest.find({}).sort({ startTime: -1 });
 
+    // Optionally attach totalPossibleScore per contest in list for consistency
+    const contestsWithTotals = await Promise.all(contests.map(async (c) => {
+      const obj = c.toObject ? c.toObject() : c;
+      try {
+        const ids = Array.isArray(obj.problems) ? obj.problems.map((p) => p.problemId) : [];
+        let totalPossibleScore = 0;
+        if (ids.length > 0) {
+          const probs = await Problem.find({ _id: { $in: ids } }, { testCases: 1, points: 1 });
+          const map = new Map(probs.map((p) => [String(p._id), p]));
+          for (const p of (obj.problems || [])) {
+            const full = map.get(String(p.problemId)) || {};
+            if (Array.isArray(full.testCases) && full.testCases.length > 0) {
+              totalPossibleScore += full.testCases.reduce((s, tc) => s + (Number(tc.points) || 0), 0);
+            } else if (typeof p.points === 'number') {
+              totalPossibleScore += Number(p.points) || 0;
+            } else if (typeof full.points === 'number') {
+              totalPossibleScore += Number(full.points) || 0;
+            }
+          }
+        }
+        obj.totalPossibleScore = totalPossibleScore;
+      } catch {}
+      return obj;
+    }));
+
     res.status(200).json({
       success: true,
-      count: contests.length,
-      data: contests
+      count: contestsWithTotals.length,
+      data: contestsWithTotals
     });
   } catch (error) {
     console.error('Get contests error:', error);
@@ -80,6 +105,24 @@ export const getContest = async (req, res) => {
       }
       return { ...p, problemId: problem };
     });
+
+    // Compute contest total possible score from per-problem test case points
+    try {
+      const problemsForTotal = Array.isArray(response.problems) ? response.problems : [];
+      let totalPossibleScore = 0;
+      for (const entry of problemsForTotal) {
+        const prob = entry?.problemId;
+        if (!prob) continue;
+        if (Array.isArray(prob.testCases) && prob.testCases.length > 0) {
+          totalPossibleScore += prob.testCases.reduce((s, tc) => s + (Number(tc.points) || 0), 0);
+        } else if (typeof entry.points === 'number') {
+          totalPossibleScore += Number(entry.points) || 0;
+        } else if (typeof prob.points === 'number') {
+          totalPossibleScore += Number(prob.points) || 0;
+        }
+      }
+      response.totalPossibleScore = totalPossibleScore;
+    } catch {}
 
     res.status(200).json({ success: true, data: response });
   } catch (error) {
@@ -175,14 +218,27 @@ export const joinContest = async (req, res) => {
       ? contest.problems
       : (await Problem.find({})).map((p, idx) => ({ problemId: p._id, order: idx + 1, points: p.points || 100 }));
 
+    // Fetch problems to compute accurate maxScore per problem from test case points
+    const problemDocs = await Problem.find({ _id: { $in: allProblems.map(p => p.problemId) } }, { testCases: 1, points: 1 });
+    const probMap = new Map(problemDocs.map(p => [String(p._id), p]));
+
     const contestResult = await ContestResult.create({
       userId,
       contestId,
-      problemResults: allProblems.map(p => ({
-        problemId: p.problemId,
-        maxScore: p.points,
-        status: 'not_attempted'
-      }))
+      problemResults: allProblems.map(p => {
+        const full = probMap.get(String(p.problemId));
+        let maxScore = Number(p.points) || 0;
+        if (full && Array.isArray(full.testCases) && full.testCases.length > 0) {
+          maxScore = full.testCases.reduce((s, tc) => s + (Number(tc.points) || 0), 0);
+        } else if (full && typeof full.points === 'number') {
+          maxScore = Number(full.points) || 0;
+        }
+        return {
+          problemId: p.problemId,
+          maxScore,
+          status: 'not_attempted'
+        };
+      })
     });
 
     res.status(200).json({
